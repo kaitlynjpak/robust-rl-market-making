@@ -101,7 +101,7 @@ We evaluate strategies under increasing **adverse selection (toxicity)**:
 ├── experiments/ # Training + evaluation scripts
 ├── analysis/ # Figures and metrics (CVaR, inventory)
 ├── figures/ # Generated plots
-└── paper/ # LaTeX research paper
+└── paper/ # LaTeX research paper**
 
 
 ---
