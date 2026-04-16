@@ -37,7 +37,7 @@ Under increasing adverse selection:
 
 ---
 
-## Environment Design (Why This Is Not a Toy Project)
+## Environment Design
 
 This simulator includes:
 
@@ -47,9 +47,6 @@ This simulator includes:
 - Regime switching (low vs high activity)
 - **Adverse selection modeling (toxicity after fills)**
 - Inventory + mark-to-market PnL tracking
-
-Most RL trading projects fail because the environment is too simple.  
-This one is designed so that **naive strategies break**.
 
 ---
 
