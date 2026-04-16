@@ -189,21 +189,24 @@ double MarketMakingEnv::compute_reward() {
     // 2. Delta PnL = current MTM - previous MTM
     double delta_pnl = current_mtm - prev_mtm_;
     
-    // 3. Inventory penalty: convert to double FIRST, then square, then multiply
+    // 3. Scale delta_pnl to bring it into a reasonable range for RL
+    double scaled_pnl = delta_pnl / config_.reward_scale;
+    
+    // 4. Inventory penalty: convert to double FIRST, then square, then multiply
     double inventory_dbl = static_cast<double>(inventory_);
     double inventory_squared = inventory_dbl * inventory_dbl;
     double inventory_penalty = config_.inventory_penalty_coeff * inventory_squared;
     
-    // 4. Turnover penalty using step_turnover (accumulated during process_fills)
+    // 5. Turnover penalty using step_turnover (accumulated during process_fills)
     double turnover_penalty = config_.turnover_penalty_coeff * step_turnover_;
     
-    // 5. Combine into reward
-    double reward = delta_pnl - inventory_penalty - turnover_penalty;
+    // 6. Combine into reward (scaled PnL minus penalties)
+    double reward = scaled_pnl - inventory_penalty - turnover_penalty;
     
-    // 6. Store current MTM as new baseline for next step
+    // 7. Store current MTM as new baseline for next step
     prev_mtm_ = current_mtm;
     
-    // 7. Return the reward
+    // 8. Return the reward
     return reward;
 }
 
@@ -494,6 +497,10 @@ double MarketMakingEnv::current_mid() const {
     double mid = (best_bid + best_ask) / 2.0;
     
     return mid;
+}
+
+double MarketMakingEnv::get_mid() const {
+    return current_mid();
 }
 
 Price MarketMakingEnv::best_bid_price() const {

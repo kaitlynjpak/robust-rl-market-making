@@ -7,10 +7,13 @@
 #include <vector>
 #include <array>
 #include <unordered_map>
+#include <unordered_set>
 
 enum class Regime : uint8_t { Low = 0, High = 1 };
 
 enum class EventType : uint8_t { LimitBuy, LimitSell, MktBuy, MktSell, Cancel };
+
+enum class ToxicDirection : uint8_t { None, Up, Down };
 
 struct SimEvent {
   EventType type;
@@ -33,6 +36,16 @@ struct RegimeMix {
 struct RegimeParams {
   double    lambda = 1000.0;  // events per second for this regime
   RegimeMix mix{};
+  double    mean_limit_qty = 5.0;   // mean quantity for limit orders
+  double    mean_market_qty = 3.0;  // mean quantity for market orders
+  double    impact_coeff = 0.0;     // price impact per unit of market order flow
+  double    impact_decay = 0.0;     // decay rate for price drift (per event)
+  
+  // Toxicity: shift market order probabilities against agent after maker fills
+  double    toxicity_prob = 0.0;      // probability of triggering toxicity after agent-maker fill
+  int       toxicity_duration = 0;    // how many events the bias lasts
+  double    toxicity_strength = 0.0;  // probability shift applied to market order sides
+  double    toxicity_drift = 0.0;     // price drift per event during toxicity (in ticks)
 };
 
 struct RegimeConfig {
@@ -145,6 +158,9 @@ private:
   double   mo_buy_slip_  = 0.0;  uint64_t mo_buy_qty_  = 0;
   double   mo_sell_slip_ = 0.0;  uint64_t mo_sell_qty_ = 0;
 
+  // Price impact: persistent drift after market orders
+  double   price_drift_ = 0.0;
+
   // optional (you used them; add if not present)
   uint64_t vol_traded_{0};
   double sum_spread_ = 0.0;
@@ -167,6 +183,17 @@ private:
   // live-id tracking for Cancel sampling
   std::vector<OrderId>               live_ids_;
   std::unordered_map<OrderId,size_t> pos_;
+
+  // Agent order tracking (for toxicity detection)
+  std::unordered_set<OrderId> agent_order_ids_;
+  
+  // Toxicity state
+  ToxicDirection toxic_direction_ = ToxicDirection::None;
+  int toxic_events_remaining_ = 0;
+  double toxic_price_drift_ = 0.0;  // directional drift applied per event during toxicity
+
+  // Helper to trigger toxicity after agent-maker fill
+  void trigger_toxicity_from_fill(const Fill& f);
 
   // RNG draws
   double draw_exp(double lambda);

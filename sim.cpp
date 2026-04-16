@@ -60,7 +60,10 @@ const RegimeMix& Simulator::mix_for(Regime r) const {
 
 Price Simulator::current_mid() const {
   Price m = ob_.mid();
-  return (m > 0) ? m : cfg_.initial_mid_ticks;
+  Price base = (m > 0) ? m : cfg_.initial_mid_ticks;
+  // Add price drift from market order impact
+  Price adjusted = base + static_cast<Price>(std::round(price_drift_));
+  return std::max(adjusted, static_cast<Price>(cfg_.min_price_ticks));
 }
 
 Price Simulator::decide_limit_price(Side s) {
@@ -113,48 +116,71 @@ OrderId Simulator::sample_live() {
 
 SimEvent Simulator::next_event() {
   // Advance time by exponential inter-arrival at current regime rate
-  double lambda = (regime_ == Regime::Low)
-              ? cfg_.regime.low.lambda
-              : cfg_.regime.high.lambda;
+  const RegimeParams& rp = (regime_ == Regime::Low)
+                         ? cfg_.regime.low
+                         : cfg_.regime.high;
 
   // CRITICAL: Actually advance time by sampling inter-arrival delay
-  t_curr_ += draw_exp(lambda);
+  t_curr_ += draw_exp(rp.lambda);
 
   // Maybe switch regime at the arrival boundary
   maybe_switch_regime();
 
-  // Choose event type
+  // Choose event type with toxicity-adjusted probabilities
   const RegimeMix& mix = mix_for(regime_);
+  
+  // Start with base probabilities
+  double p_mkt_buy = mix.p_mkt_buy;
+  double p_mkt_sell = mix.p_mkt_sell;
+  
+  // Apply toxicity bias if active
+  if (toxic_events_remaining_ > 0 && toxic_direction_ != ToxicDirection::None) {
+    double shift = rp.toxicity_strength;
+    
+    if (toxic_direction_ == ToxicDirection::Up) {
+      // Bias toward buys (price pressure up)
+      double actual_shift = std::min(shift, p_mkt_sell);  // Can't shift more than available
+      p_mkt_buy += actual_shift;
+      p_mkt_sell -= actual_shift;
+    } else {
+      // Bias toward sells (price pressure down)
+      double actual_shift = std::min(shift, p_mkt_buy);
+      p_mkt_sell += actual_shift;
+      p_mkt_buy -= actual_shift;
+    }
+  }
+  
+  // Compute cumulative thresholds
+  double c1 = mix.p_limit_buy;
+  double c2 = c1 + mix.p_limit_sell;
+  double c3 = c2 + p_mkt_buy;
+  double c4 = c3 + p_mkt_sell;
+  
   std::uniform_real_distribution<double> U(0.0, 1.0);
   double u = U(rng_);
 
-  double c1 = mix.p_limit_buy;
-  double c2 = c1 + mix.p_limit_sell;
-  double c3 = c2 + mix.p_mkt_buy;
-  double c4 = c3 + mix.p_mkt_sell;
-
   SimEvent ev{};
-  ev.ts = t_curr_;  // Now this is meaningful (in seconds)
+  ev.ts = t_curr_;
   ev.side = Side::Buy;
 
   if (u < c1) {
     ev.type = EventType::LimitBuy;
     ev.side = Side::Buy;
-    ev.qty = draw_geometric_mean(cfg_.mean_limit_qty);
+    ev.qty = draw_geometric_mean(rp.mean_limit_qty);
     ev.px  = decide_limit_price(Side::Buy);
   } else if (u < c2) {
     ev.type = EventType::LimitSell;
     ev.side = Side::Sell;
-    ev.qty = draw_geometric_mean(cfg_.mean_limit_qty);
+    ev.qty = draw_geometric_mean(rp.mean_limit_qty);
     ev.px  = decide_limit_price(Side::Sell);
   } else if (u < c3) {
     ev.type = EventType::MktBuy;
     ev.side = Side::Buy;
-    ev.qty = draw_geometric_mean(cfg_.mean_market_qty);
+    ev.qty = draw_geometric_mean(rp.mean_market_qty);
   } else if (u < c4) {
     ev.type = EventType::MktSell;
     ev.side = Side::Sell;
-    ev.qty = draw_geometric_mean(cfg_.mean_market_qty);
+    ev.qty = draw_geometric_mean(rp.mean_market_qty);
   } else {
     ev.type = EventType::Cancel;
     OrderId target = sample_live();
@@ -165,7 +191,7 @@ SimEvent Simulator::next_event() {
       std::bernoulli_distribution B(0.5);
       ev.type = B(rng_) ? EventType::LimitBuy : EventType::LimitSell;
       ev.side = (ev.type == EventType::LimitBuy) ? Side::Buy : Side::Sell;
-      ev.qty  = draw_geometric_mean(cfg_.mean_limit_qty);
+      ev.qty  = draw_geometric_mean(rp.mean_limit_qty);
       ev.px   = decide_limit_price(ev.side);
     }
   }
@@ -238,6 +264,11 @@ void Simulator::execute(const SimEvent& e, std::vector<Fill>& fills) {
         double slip = (vwap - mid0);      // buy pays above mid ⇒ positive
         mo_buy_slip_ += slip * qsum;
         mo_buy_qty_  += qsum;
+        
+        // Apply price impact: buy pressure pushes price up
+        const RegimeParams& rp = (regime_ == Regime::Low) 
+                               ? cfg_.regime.low : cfg_.regime.high;
+        price_drift_ += rp.impact_coeff * static_cast<double>(qsum);
       }
       break;
     }
@@ -251,6 +282,11 @@ void Simulator::execute(const SimEvent& e, std::vector<Fill>& fills) {
         double slip = (mid0 - vwap);      // sell receives below mid ⇒ positive
         mo_sell_slip_ += slip * qsum;
         mo_sell_qty_  += qsum;
+        
+        // Apply price impact: sell pressure pushes price down
+        const RegimeParams& rp = (regime_ == Regime::Low) 
+                               ? cfg_.regime.low : cfg_.regime.high;
+        price_drift_ -= rp.impact_coeff * static_cast<double>(qsum);
       }
       break;
     }
@@ -282,10 +318,21 @@ void Simulator::execute(const SimEvent& e, std::vector<Fill>& fills) {
       lim_bucket_by_id_.erase(it);
     }
   }
+
+  // ---- Toxicity trigger ----
+  // Check if any fill involved an agent order as maker
+  // IMPORTANT: Do this BEFORE cleaning up agent_order_ids_
+  for (const auto& f : fills) {
+    if (agent_order_ids_.count(f.maker_id)) {
+      trigger_toxicity_from_fill(f);
+    }
+  }
+
   // Remove makers from live set only if fully filled (no longer in book)
   for (const auto& f : fills) {
     if (ob_.index.find(f.maker_id) == ob_.index.end()) {
       live_remove(f.maker_id);
+      agent_order_ids_.erase(f.maker_id);  // Clean up agent tracking
     }
   }
 
@@ -297,6 +344,23 @@ void Simulator::execute(const SimEvent& e, std::vector<Fill>& fills) {
     case EventType::MktBuy:
     case EventType::MktSell:  ++n_markets_; break;
     case EventType::Cancel:   ++n_cancels_; break;
+  }
+
+  // ---- Price drift decay (from market impact) ----
+  const RegimeParams& rp = (regime_ == Regime::Low) 
+                         ? cfg_.regime.low : cfg_.regime.high;
+  price_drift_ *= (1.0 - rp.impact_decay);
+
+  // ---- Toxicity: apply price drift and countdown ----
+  if (toxic_events_remaining_ > 0) {
+    // Apply directional drift to price_drift_ (accumulates)
+    price_drift_ += toxic_price_drift_;
+    
+    --toxic_events_remaining_;
+    if (toxic_events_remaining_ == 0) {
+      toxic_direction_ = ToxicDirection::None;
+      toxic_price_drift_ = 0.0;
+    }
   }
 
   // Track spread (only if both sides exist)
@@ -392,6 +456,8 @@ void Simulator::run() {
 // These maintain live_ids_ bookkeeping so agent orders are tracked consistently
 // with background market orders. This means agent orders CAN be randomly
 // canceled by simulator cancel events, which is realistic behavior.
+//
+// Agent orders are also tracked in agent_order_ids_ for adverse selection.
 // =============================================================================
 
 OrderId Simulator::submit_agent_order(Side side, Price price, Qty quantity,
@@ -399,18 +465,27 @@ OrderId Simulator::submit_agent_order(Side side, Price price, Qty quantity,
   // Step 1: Submit the limit order through the matching engine
   OrderId id = me_.submit_limit(side, price, quantity, ts, fills);
   
-  // Step 2: Add to live order tracking if it's resting
+  // Step 2: Register as agent order
+  agent_order_ids_.insert(id);
+  
+  // Step 3: Add to live order tracking if it's resting
   live_add_if_resting(id);
   
-  // Step 3: Remove filled makers from live tracking only if fully filled
+  // Step 4: Remove filled makers from live tracking only if fully filled
   // (A partial fill leaves the maker still resting in the book)
   for (const auto& f : fills) {
     if (ob_.index.find(f.maker_id) == ob_.index.end()) {
       live_remove(f.maker_id);
+      agent_order_ids_.erase(f.maker_id);  // Clean up if agent order was maker
     }
   }
   
-  // Step 4: Return the order ID
+  // Step 5: If this order was fully filled immediately, unregister it
+  if (ob_.index.find(id) == ob_.index.end()) {
+    agent_order_ids_.erase(id);
+  }
+  
+  // Step 6: Return the order ID
   return id;
 }
 
@@ -420,4 +495,40 @@ void Simulator::cancel_agent_order(OrderId id) {
   
   // Step 2: Remove from live order tracking
   live_remove(id);
+  
+  // Step 3: Unregister as agent order
+  agent_order_ids_.erase(id);
+}
+
+// =============================================================================
+// Toxicity Trigger
+// =============================================================================
+// Called when an agent order is filled as maker. Triggers a temporary bias
+// in market order direction against the agent's new position.
+// =============================================================================
+
+void Simulator::trigger_toxicity_from_fill(const Fill& f) {
+  const RegimeParams& rp = (regime_ == Regime::Low) 
+                         ? cfg_.regime.low : cfg_.regime.high;
+  
+  // Probabilistically trigger toxicity
+  std::bernoulli_distribution trigger(rp.toxicity_prob);
+  if (!trigger(rng_)) return;
+  
+  // If taker bought, agent (maker) sold -> agent is now short
+  // We want price to go UP to hurt them (adverse selection)
+  // If taker sold, agent (maker) bought -> agent is now long
+  // We want price to go DOWN to hurt them (adverse selection)
+  
+  if (f.taker_side == Side::Buy) {
+    // Agent sold -> drift UP to hurt them
+    toxic_direction_ = ToxicDirection::Up;
+    toxic_price_drift_ = +rp.toxicity_drift;
+  } else {
+    // Agent bought -> drift DOWN to hurt them
+    toxic_direction_ = ToxicDirection::Down;
+    toxic_price_drift_ = -rp.toxicity_drift;
+  }
+  
+  toxic_events_remaining_ = rp.toxicity_duration;
 }

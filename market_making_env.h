@@ -37,6 +37,7 @@ struct EnvConfig {
     // Reward shaping
     double inventory_penalty_coeff = 0.001;
     double turnover_penalty_coeff = 0.0001;
+    double reward_scale = 1.0;              // Divide delta_pnl by this before combining
     
     // Volatility estimation
     size_t volatility_window = 20;              // Number of mid samples for rolling vol
@@ -48,6 +49,10 @@ struct EnvConfig {
     
     // Tick size (in your sim, prices are integer ticks, so tick_size = 1)
     double tick_size = 1.0;
+    
+    // Action bounds (single source of truth for RL)
+    int max_offset = 5;    // bid_offset/ask_offset in [0, max_offset]
+    int max_size = 3;      // bid_size/ask_size in [1, max_size]
     
     // Simulator config to use for each episode
     SimConfig sim_config;
@@ -130,6 +135,8 @@ public:
     double current_cash() const { return cash_; }
     double current_time() const { return current_time_; }
     bool is_done() const { return done_; }
+    double get_mid() const;  // Expose mid price for diagnostics
+    const EnvConfig& config() const { return config_; }  // Expose config for bindings
     
 private:
     // ========================================================================
